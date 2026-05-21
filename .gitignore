@@ -1,5 +1,7 @@
 save_weights/
 VOC2007/
 validation_results/
+augmentation_examples/
+数据增强展示图片/
 __pycache__/
 *.pyc

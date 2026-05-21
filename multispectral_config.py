@@ -12,7 +12,7 @@
 
 # 训练好的权重路径。
 # 后续改造 predict.py / validation.py 时，会默认从这里读取推理权重。
-trained_model_path = "save_weights/6band/model_best.pth"
+trained_model_path = "save_weights/rgb/model_best.pth"
 
 # 输入影像文件后缀。
 # 当前 VOC2007/JPEGImages 目录里存放的是多波段 tif 影像，所以这里使用 .tif。
