@@ -12,7 +12,7 @@
 
 # 训练好的权重路径。
 # 后续改造 predict.py / validation.py 时，会默认从这里读取推理权重。
-trained_model_path = "save_weights/rgb/model_best.pth"
+trained_model_path = "save_weights/6band/model_best.pth"
 
 # 输入影像文件后缀。
 # 当前 VOC2007/JPEGImages 目录里存放的是多波段 tif 影像，所以这里使用 .tif。
@@ -101,6 +101,47 @@ normalization_configs = {
 
 # 当前模式对应的归一化配置。
 normalization_config = normalization_configs[band_mode]
+
+
+# ----------------------------------------------------------------------
+# 4. Training-time online data augmentation
+# ----------------------------------------------------------------------
+# These augmentations are used only for the training set. Validation and test
+# samples must remain unchanged, so the reported metrics still reflect the
+# original data distribution.
+#
+# The probabilities are designed for the current 637-sample Sentinel-2 PV
+# dataset. They improve generalization by simulating seasonal reflectance
+# changes, shadows, array orientation changes, sensor noise, and scale changes.
+train_augmentation_config = {
+    "enabled": True,
+
+    # Multispectral reflectance perturbation.
+    # Simulates seasonal, solar-angle, atmospheric and surface-moisture changes.
+    "reflectance_prob": 0.50,
+    "reflectance_global_range": [0.90, 1.10],
+    "reflectance_band_range": [0.95, 1.05],
+
+    # Geometry perturbation.
+    # Simulates different PV array directions and cutting orientations.
+    "geometry_prob": 0.50,
+
+    # Soft local shadow / thin cloud-shadow perturbation.
+    # Simulates residual cloud shadow, terrain shadow and PV array shadow.
+    "shadow_prob": 0.25,
+    "shadow_factor_range": [0.75, 0.90],
+    "shadow_radius_range": [0.25, 0.45],
+
+    # Mild Gaussian noise.
+    # Simulates sensor noise, atmospheric residuals and local abnormal pixels.
+    "noise_prob": 0.25,
+    "noise_sigma_range": [0.003, 0.008],
+
+    # Random scale by center crop and resize back.
+    # Simulates different PV plant sizes and patch cutting positions.
+    "scale_prob": 0.20,
+    "scale_crop_range": [0.85, 1.00],
+}
 
 
 def _check_channel_values(config, key, expected_channels):

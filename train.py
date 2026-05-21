@@ -13,6 +13,7 @@ from multispectral_config import (
     in_channels,
     normalization_config,
     selected_bands,
+    train_augmentation_config,
 )
 from my_dataset import VOCSegmentationDataset
 from src import u2net_full
@@ -62,6 +63,7 @@ def print_multispectral_config(save_dir):
     print(f"  selected_bands: {selected_bands}")
     print(f"  in_channels   : {in_channels}")
     print(f"  normalization : {normalization_config}")
+    print(f"  augmentation  : {train_augmentation_config}")
     print(f"  save_dir      : {save_dir}")
 
 
@@ -105,10 +107,11 @@ def main(args):
     train_dataset = VOCSegmentationDataset(
         args.data_path,
         train=True,
-        transforms=SODPresetTrain(input_size, crop_size=args.input_size),
+        transforms=SODPresetTrain(input_size, crop_size=args.input_size, hflip_prob=0.0),
         image_ext=image_ext,
         selected_bands=selected_bands,
         normalization_config=normalization_config,
+        augmentation_config=train_augmentation_config,
     )
     val_dataset = VOCSegmentationDataset(
         args.data_path,

@@ -1,3 +1,4 @@
+import random
 import os
 
 import numpy as np
@@ -85,7 +86,8 @@ def cat_list(images, fill_value=0):
 
 class VOCSegmentationDataset(data.Dataset):
     def __init__(self, root: str, train: bool = True, transforms=None,
-                 image_ext: str = ".tif", selected_bands=None, normalization_config=None):
+                 image_ext: str = ".tif", selected_bands=None, normalization_config=None,
+                 augmentation_config=None):
         assert os.path.exists(root), f"path '{root}' does not exist."
         self.voc_root = self._resolve_voc_root(root)
         split = "train" if train else "val"
@@ -104,6 +106,7 @@ class VOCSegmentationDataset(data.Dataset):
         # 对当前数据来说就是 [B4, B3, B2] 真彩色三通道。
         self.selected_bands = list(selected_bands) if selected_bands is not None else None
         self.normalization_config = normalization_config or {}
+        self.augmentation_config = augmentation_config or {"enabled": False}
         self.transforms = transforms
 
         self.images_path = [os.path.join(self.image_root, name + image_ext) for name in names]
@@ -131,6 +134,8 @@ class VOCSegmentationDataset(data.Dataset):
         # 原始 mask 里只要大于 0 就视为前景，统一映射成 255，
         # 这样后续 ToTensor 后 target 仍是 0 或 1。
         target = (target > 0).astype(np.uint8) * 255
+        if self._use_training_augmentation(image):
+            image, target = self._augment_training_sample(image, target)
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
@@ -166,6 +171,129 @@ class VOCSegmentationDataset(data.Dataset):
         image = self._normalize_multispectral(image)
         self._check_channel_count(image, image_path)
         return image
+
+    def _use_training_augmentation(self, image):
+        return (
+            self.augmentation_config.get("enabled", False)
+            and isinstance(image, np.ndarray)
+            and image.ndim == 3
+            and image.dtype == np.float32
+        )
+
+    def _to_reflectance(self, image):
+        """Convert normalized image back to reflectance before spectral aug.
+
+        VOCSegmentationDataset normalizes tif data before transforms. To keep
+        reflectance augmentation physically meaningful, we undo mean/std here,
+        perturb reflectance, then apply the same normalization again.
+        """
+        reflectance = image.astype(np.float32, copy=True)
+        if self.normalization_config.get("enable_mean_std", False):
+            mean = self._channel_values("mean")
+            std = self._channel_values("std")
+            reflectance = reflectance * std + mean
+        return reflectance
+
+    def _from_reflectance(self, reflectance):
+        """Apply the configured clip and mean/std after training augmentation."""
+        image = reflectance.astype(np.float32, copy=False)
+        if self.normalization_config.get("enable_clip", False):
+            clip_min = self._channel_values("clip_min")
+            clip_max = self._channel_values("clip_max")
+            image = np.clip(image, clip_min, clip_max)
+        if self.normalization_config.get("enable_mean_std", False):
+            mean = self._channel_values("mean")
+            std = self._channel_values("std")
+            image = (image - mean) / std
+        return image.astype(np.float32)
+
+    def _augment_training_sample(self, image, target):
+        """Online Sentinel-2 PV augmentation used only for the training split.
+
+        The goal is better cross-season and cross-region generalization, not
+        artificially improving validation metrics. Validation/test data are not
+        augmented.
+        """
+        cfg = self.augmentation_config
+        reflectance = self._to_reflectance(image)
+
+        if random.random() < cfg.get("geometry_prob", 0.0):
+            reflectance, target = self._augment_geometry(reflectance, target)
+
+        if random.random() < cfg.get("scale_prob", 0.0):
+            reflectance, target = self._augment_random_scale(reflectance, target)
+
+        if random.random() < cfg.get("reflectance_prob", 0.0):
+            reflectance = self._augment_reflectance(reflectance)
+
+        if random.random() < cfg.get("shadow_prob", 0.0):
+            reflectance = self._augment_shadow(reflectance)
+
+        if random.random() < cfg.get("noise_prob", 0.0):
+            reflectance = self._augment_noise(reflectance)
+
+        return self._from_reflectance(reflectance), target
+
+    def _augment_geometry(self, image, target):
+        op = random.choice(["hflip", "vflip", "rot90", "rot180", "rot270"])
+        if op == "hflip":
+            return np.ascontiguousarray(image[:, ::-1, :]), np.ascontiguousarray(target[:, ::-1])
+        if op == "vflip":
+            return np.ascontiguousarray(image[::-1, :, :]), np.ascontiguousarray(target[::-1, :])
+        k = {"rot90": 1, "rot180": 2, "rot270": 3}[op]
+        return np.rot90(image, k=k).copy(), np.rot90(target, k=k).copy()
+
+    def _augment_reflectance(self, image):
+        cfg = self.augmentation_config
+        global_low, global_high = cfg.get("reflectance_global_range", [0.90, 1.10])
+        band_low, band_high = cfg.get("reflectance_band_range", [0.95, 1.05])
+        global_factor = random.uniform(global_low, global_high)
+        band_factors = np.random.uniform(
+            band_low,
+            band_high,
+            size=(1, 1, image.shape[2]),
+        ).astype(np.float32)
+        return image * global_factor * band_factors
+
+    def _augment_shadow(self, image):
+        cfg = self.augmentation_config
+        factor_low, factor_high = cfg.get("shadow_factor_range", [0.75, 0.90])
+        radius_low, radius_high = cfg.get("shadow_radius_range", [0.25, 0.45])
+        h, w = image.shape[:2]
+        center_y = random.uniform(-0.5, 0.5)
+        center_x = random.uniform(-0.5, 0.5)
+        radius = random.uniform(radius_low, radius_high)
+        yy = np.linspace(-1, 1, h, dtype=np.float32)[:, None]
+        xx = np.linspace(-1, 1, w, dtype=np.float32)[None, :]
+        shadow = np.exp(-((xx - center_x) ** 2 + (yy - center_y) ** 2) / max(radius, 1e-6))
+        factor = random.uniform(factor_low, factor_high)
+        shadow_map = 1.0 - (1.0 - factor) * shadow
+        return image * shadow_map[:, :, None]
+
+    def _augment_noise(self, image):
+        sigma_low, sigma_high = self.augmentation_config.get("noise_sigma_range", [0.003, 0.008])
+        sigma = random.uniform(sigma_low, sigma_high)
+        noise = np.random.normal(0.0, sigma, size=image.shape).astype(np.float32)
+        return image + noise
+
+    def _augment_random_scale(self, image, target):
+        if cv2 is None:
+            return image, target
+        crop_low, crop_high = self.augmentation_config.get("scale_crop_range", [0.85, 1.00])
+        ratio = random.uniform(crop_low, crop_high)
+        h, w = image.shape[:2]
+        crop_h = max(8, int(h * ratio))
+        crop_w = max(8, int(w * ratio))
+        top = random.randint(0, max(0, h - crop_h))
+        left = random.randint(0, max(0, w - crop_w))
+
+        image_crop = image[top:top + crop_h, left:left + crop_w, :]
+        target_crop = target[top:top + crop_h, left:left + crop_w]
+        image = cv2.resize(image_crop, (w, h), interpolation=cv2.INTER_LINEAR)
+        target = cv2.resize(target_crop, (w, h), interpolation=cv2.INTER_NEAREST)
+        if image.ndim == 2:
+            image = image[:, :, None]
+        return image.astype(np.float32), target.astype(np.uint8)
 
     def _normalize_multispectral(self, image):
         """按配置对多光谱反射率做缩放、裁剪和标准化。"""
