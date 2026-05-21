@@ -1,3 +1,5 @@
 save_weights/
 VOC2007/
 validation_results/
+__pycache__/
+*.pyc
