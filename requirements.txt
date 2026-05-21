@@ -1,0 +1,15 @@
+# Core numerical / image dependencies
+numpy==1.22.0
+Pillow>=8.0.0
+opencv-python==4.5.4.60
+matplotlib>=3.5.0
+
+# Multispectral GeoTIFF reader
+rasterio
+
+# PyTorch runtime
+# torch 1.13.1 should be paired with torchvision 0.14.1.
+# If you need a CUDA build, install the matching torch/torchvision wheels
+# from the official PyTorch command for your CUDA version.
+torch==1.13.1
+torchvision==0.14.1
