@@ -5,3 +5,9 @@ augmentation_examples/
 数据增强展示图片/
 __pycache__/
 *.pyc
+predict_results/
+论文制图/测试图/
+测试结果/
+6band测试结果/
+论文制图/
+figures/
