@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -265,6 +266,22 @@ def load_model(weights_path, device):
     return model
 
 
+def count_model_parameters(model):
+    """返回模型总参数量和可训练参数量。"""
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    return {
+        "total": int(total),
+        "trainable": int(trainable),
+    }
+
+
+def synchronize_device(device):
+    """CUDA 为异步执行，计时前后同步才能得到真实耗时。"""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def make_starts(length, tile_size, stride):
     if length <= tile_size:
         return [0]
@@ -331,8 +348,10 @@ def undo_tta_tensor(pred, mode):
     raise ValueError("Unsupported TTA mode: %s" % mode)
 
 
-def infer_batch(model, batch_tiles, device, tta_modes):
+def infer_batch(model, batch_tiles, device, tta_modes, timing_stats):
     batch = torch.from_numpy(np.stack(batch_tiles, axis=0)).to(device)
+    synchronize_device(device)
+    forward_start = time.perf_counter()
     with torch.no_grad():
         probs = model(batch)
         if tta_modes:
@@ -341,6 +360,11 @@ def infer_batch(model, batch_tiles, device, tta_modes):
                 aug_probs = model(aug_batch)
                 probs = probs + undo_tta_tensor(aug_probs, mode)
             probs = probs / float(len(tta_modes) + 1)
+    synchronize_device(device)
+    timing_stats["model_forward_seconds"] += time.perf_counter() - forward_start
+    timing_stats["inference_batches"] += 1
+    timing_stats["forward_passes"] += len(tta_modes) + 1
+    timing_stats["forward_samples"] += len(batch_tiles) * (len(tta_modes) + 1)
     return probs.detach().cpu().numpy().astype(np.float32)
 
 
@@ -353,11 +377,11 @@ def resize_prob_to_context(prob, context_size):
     )
 
 
-def flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes):
+def flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes, timing_stats):
     if not pending:
         return 0
 
-    probs = infer_batch(model, [item["tensor"] for item in pending], device, tta_modes)
+    probs = infer_batch(model, [item["tensor"] for item in pending], device, tta_modes, timing_stats)
 
     for item, prob in zip(pending, probs):
         x0 = item["x0"]
@@ -453,7 +477,18 @@ def postprocess_class_map(class_path, args):
         dst.write(mask[np.newaxis, :, :])
 
 
-def save_run_metadata(args, scales, scale_weights, tta_modes, width, height, used, skipped):
+def save_run_metadata(
+    args,
+    scales,
+    scale_weights,
+    tta_modes,
+    width,
+    height,
+    used,
+    skipped,
+    model_parameters,
+    timing_stats,
+):
     if not args.save_run_json:
         return
     meta_path = os.path.splitext(args.out_class)[0] + "_run_config.json"
@@ -488,6 +523,8 @@ def save_run_metadata(args, scales, scale_weights, tta_modes, width, height, use
         "skip_zero_ratio": args.skip_zero_ratio,
         "inferred_tiles": used,
         "skipped_tiles": skipped,
+        "model_parameters": model_parameters,
+        "timing": timing_stats,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -528,7 +565,11 @@ def main():
     scale_weights = (scale_weights / np.maximum(scale_weights.sum(), 1e-6)).tolist()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    model_load_start = time.perf_counter()
     model = load_model(args.weights, device)
+    synchronize_device(device)
+    model_load_seconds = time.perf_counter() - model_load_start
+    model_parameters = count_model_parameters(model)
 
     if args.overlap < 0 or args.overlap >= args.tile_size:
         raise ValueError("overlap 必须满足 0 <= overlap < tile_size")
@@ -578,12 +619,25 @@ def main():
             "close_iter": args.morph_close_iterations,
         })
         print("device          :", device)
+        print("parameters      :", "{:,}".format(model_parameters["total"]))
+        print("trainable params:", "{:,}".format(model_parameters["trainable"]))
         print("tiles total     :", total)
         print("=============================================")
 
         pending = []
         used = 0
         skipped = 0
+        timing_stats = {
+            "requested_device": args.device,
+            "effective_device": str(device),
+            "cuda_device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+            "model_load_seconds": model_load_seconds,
+            "model_forward_seconds": 0.0,
+            "inference_batches": 0,
+            "forward_passes": 0,
+            "forward_samples": 0,
+        }
+        pipeline_start = time.perf_counter()
         with tqdm(total=total, desc="infer", ncols=100) as pbar:
             for y0 in ys:
                 for x0 in xs:
@@ -616,13 +670,58 @@ def main():
                             }
                         )
                         if len(pending) >= args.batch_size:
-                            used += flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes)
+                            used += flush_pending(
+                                model,
+                                pending,
+                                score_sum,
+                                weight_sum,
+                                weight_window,
+                                device,
+                                tta_modes,
+                                timing_stats,
+                            )
                         pbar.update(1)
 
-        used += flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes)
+        used += flush_pending(
+            model,
+            pending,
+            score_sum,
+            weight_sum,
+            weight_window,
+            device,
+            tta_modes,
+            timing_stats,
+        )
+        timing_stats["sliding_window_inference_seconds"] = time.perf_counter() - pipeline_start
+
+        output_start = time.perf_counter()
         write_outputs(src, args, score_sum, weight_sum, height, width)
         postprocess_class_map(args.out_class, args)
-        save_run_metadata(args, scales, scale_weights, tta_modes, width, height, used, skipped)
+        timing_stats["output_and_postprocess_seconds"] = time.perf_counter() - output_start
+        timing_stats["total_processing_seconds"] = time.perf_counter() - pipeline_start
+        timing_stats["end_to_end_seconds"] = (
+            timing_stats["model_load_seconds"] + timing_stats["total_processing_seconds"]
+        )
+        timing_stats["seconds_per_inferred_tile"] = (
+            timing_stats["sliding_window_inference_seconds"] / used if used else None
+        )
+        timing_stats["model_ms_per_forward_sample"] = (
+            timing_stats["model_forward_seconds"] * 1000.0 / timing_stats["forward_samples"]
+            if timing_stats["forward_samples"]
+            else None
+        )
+        save_run_metadata(
+            args,
+            scales,
+            scale_weights,
+            tta_modes,
+            width,
+            height,
+            used,
+            skipped,
+            model_parameters,
+            timing_stats,
+        )
 
         print("[done] class map:", args.out_class)
         if args.out_conf:
@@ -631,6 +730,11 @@ def main():
             print("[done] uncertainty map:", args.out_uncertainty)
         print("[info] inferred tiles:", used)
         print("[info] skipped tiles :", skipped)
+        print("[time] model forward : %.3f s" % timing_stats["model_forward_seconds"])
+        print("[time] sliding-window: %.3f s" % timing_stats["sliding_window_inference_seconds"])
+        print("[time] output + post : %.3f s" % timing_stats["output_and_postprocess_seconds"])
+        print("[time] total process : %.3f s" % timing_stats["total_processing_seconds"])
+        print("[time] end-to-end    : %.3f s" % timing_stats["end_to_end_seconds"])
 
         # Windows 下 memmap 文件需要显式释放，否则后面删除临时文件时可能被系统判定仍被占用。
         score_sum.flush()

@@ -4,6 +4,7 @@ import os
 import gc
 import struct
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -68,12 +69,15 @@ ALL_TOUCHED = True
 
 SAVE_LABEL_TIF = True
 SAVE_PRED_TIF = True
+# Keep False when measuring runtime; reused prediction files have no comparable inference time.
 REUSE_EXISTING_PRED_TIF = False
 
 TEMP_DIR = "tmp_big_tif_shp_eval"
 WRITE_BLOCK = 2048
 KEEP_TEMP = False
 DEVICE = "cuda:0"
+# Timing warm-up. These forward passes are not included in any mode's runtime.
+WARMUP_BATCHES = 3
 # ===========================================================
 
 
@@ -108,6 +112,12 @@ MODE_CONFIGS = {
         "morph_open_iterations": MORPH_OPEN_ITERATIONS,
         "morph_close_iterations": MORPH_CLOSE_ITERATIONS,
     },
+}
+
+MODE_DISPLAY_NAMES = {
+    "plain": "plain",
+    "full_no_tta": "full no TTA",
+    "full_tta": "full TTA",
 }
 
 
@@ -148,6 +158,26 @@ def load_model(weights_path, device):
     model.to(device)
     model.eval()
     return model
+
+
+def synchronize_device(device):
+    """Synchronize CUDA so asynchronous kernels are included in timings."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def warmup_model(model, device):
+    """Warm up the model once before comparing the three inference modes."""
+    if WARMUP_BATCHES <= 0:
+        return
+
+    print("[timing] warming up model (%d batches)..." % WARMUP_BATCHES)
+    dummy = torch.zeros((BATCH_SIZE, in_channels, INPUT_SIZE, INPUT_SIZE), device=device)
+    with torch.no_grad():
+        for _ in range(WARMUP_BATCHES):
+            model(dummy)
+    synchronize_device(device)
+    del dummy
 
 
 def make_starts(length, tile_size, stride):
@@ -210,8 +240,10 @@ def undo_tta_tensor(pred, mode):
     return apply_tta_tensor(pred, mode)
 
 
-def infer_batch(model, batch_tiles, device, tta_modes):
+def infer_batch(model, batch_tiles, device, tta_modes, timing_stats):
     batch = torch.from_numpy(np.stack(batch_tiles, axis=0)).to(device)
+    synchronize_device(device)
+    model_start = time.perf_counter()
     with torch.no_grad():
         probs = model(batch)
         for mode in tta_modes:
@@ -219,6 +251,12 @@ def infer_batch(model, batch_tiles, device, tta_modes):
             aug_probs = model(aug_batch)
             probs = probs + undo_tta_tensor(aug_probs, mode)
         probs = probs / float(len(tta_modes) + 1)
+    synchronize_device(device)
+
+    timing_stats["model_forward_seconds"] += time.perf_counter() - model_start
+    timing_stats["inference_batches"] += 1
+    timing_stats["forward_passes"] += len(tta_modes) + 1
+    timing_stats["forward_samples"] += len(batch_tiles) * (len(tta_modes) + 1)
     return probs.detach().cpu().numpy().astype(np.float32)
 
 
@@ -231,11 +269,17 @@ def resize_prob_to_context(prob, context_size):
     )
 
 
-def flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes):
+def flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes, timing_stats):
     if not pending:
         return 0
 
-    probs = infer_batch(model, [item["tensor"] for item in pending], device, tta_modes)
+    probs = infer_batch(
+        model,
+        [item["tensor"] for item in pending],
+        device,
+        tta_modes,
+        timing_stats,
+    )
     for item, prob in zip(pending, probs):
         x0 = item["x0"]
         y0 = item["y0"]
@@ -399,7 +443,31 @@ def postprocess_prediction(pred_path, mode_cfg):
 def run_inference_mode(src, model, mode_name, mode_cfg, pred_path, device):
     if REUSE_EXISTING_PRED_TIF and os.path.exists(pred_path):
         print("[reuse] prediction exists:", pred_path)
-        return
+        print("[timing] reused predictions cannot provide a comparable inference time")
+        return {
+            "reused_prediction": True,
+            "model_forward_seconds": None,
+            "sliding_window_seconds": None,
+            "write_prediction_seconds": None,
+            "postprocess_seconds": None,
+            "total_inference_seconds": None,
+            "relative_time_vs_full_no_tta": None,
+            "inference_batches": None,
+            "forward_passes": None,
+            "forward_samples": None,
+            "inferred_tiles": None,
+            "skipped_tiles": None,
+        }
+
+    synchronize_device(device)
+    total_start = time.perf_counter()
+    timing_stats = {
+        "reused_prediction": False,
+        "model_forward_seconds": 0.0,
+        "inference_batches": 0,
+        "forward_passes": 0,
+        "forward_samples": 0,
+    }
 
     overlap = int(mode_cfg["overlap"])
     if overlap < 0 or overlap >= TILE_SIZE:
@@ -433,6 +501,7 @@ def run_inference_mode(src, model, mode_name, mode_cfg, pred_path, device):
     pending = []
     used = 0
     skipped = 0
+    sliding_start = time.perf_counter()
     with tqdm(total=total, desc="infer " + mode_name, ncols=100) as pbar:
         for y0 in ys:
             for x0 in xs:
@@ -465,11 +534,33 @@ def run_inference_mode(src, model, mode_name, mode_cfg, pred_path, device):
                         }
                     )
                     if len(pending) >= BATCH_SIZE:
-                        used += flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes)
+                        used += flush_pending(
+                            model,
+                            pending,
+                            score_sum,
+                            weight_sum,
+                            weight_window,
+                            device,
+                            tta_modes,
+                            timing_stats,
+                        )
                     pbar.update(1)
 
-    used += flush_pending(model, pending, score_sum, weight_sum, weight_window, device, tta_modes)
+    used += flush_pending(
+        model,
+        pending,
+        score_sum,
+        weight_sum,
+        weight_window,
+        device,
+        tta_modes,
+        timing_stats,
+    )
+    timing_stats["sliding_window_seconds"] = time.perf_counter() - sliding_start
+
+    write_start = time.perf_counter()
     write_prediction_tif(src, pred_path, score_sum, weight_sum)
+    timing_stats["write_prediction_seconds"] = time.perf_counter() - write_start
     score_sum.flush()
     weight_sum.flush()
     del score_sum
@@ -483,8 +574,27 @@ def run_inference_mode(src, model, mode_name, mode_cfg, pred_path, device):
                 except PermissionError:
                     print("[warn] temp file is still locked, keep it:", path)
 
+    postprocess_start = time.perf_counter()
     postprocess_prediction(pred_path, mode_cfg)
+    timing_stats["postprocess_seconds"] = time.perf_counter() - postprocess_start
+    timing_stats["total_inference_seconds"] = time.perf_counter() - total_start
+    timing_stats["relative_time_vs_full_no_tta"] = None
+    timing_stats["inferred_tiles"] = used
+    timing_stats["skipped_tiles"] = skipped
+
     print("[done] %s used tiles=%d skipped=%d pred=%s" % (mode_name, used, skipped, pred_path))
+    print(
+        "[timing] %s total=%.3fs sliding=%.3fs model=%.3fs write=%.3fs post=%.3fs"
+        % (
+            mode_name,
+            timing_stats["total_inference_seconds"],
+            timing_stats["sliding_window_seconds"],
+            timing_stats["model_forward_seconds"],
+            timing_stats["write_prediction_seconds"],
+            timing_stats["postprocess_seconds"],
+        )
+    )
+    return timing_stats
 
 
 def update_hist(hist, gt, pred, valid):
@@ -549,7 +659,32 @@ def metrics_from_hist(hist):
     }
 
 
-def save_metrics(output_dir, records):
+def add_relative_timings(records, baseline_mode="full_no_tta"):
+    """Add runtime ratios using full_no_tta as the paper-table baseline."""
+    baseline_record = records.get(baseline_mode, {})
+    baseline_timing = baseline_record.get("timing") or {}
+    baseline_seconds = baseline_timing.get("total_inference_seconds")
+
+    for record in records.values():
+        timing = record.get("timing") or {}
+        total_seconds = timing.get("total_inference_seconds")
+        if baseline_seconds and total_seconds is not None:
+            timing["relative_time_vs_full_no_tta"] = total_seconds / baseline_seconds
+        else:
+            timing["relative_time_vs_full_no_tta"] = None
+
+
+def format_optional(value, digits=6):
+    if value is None:
+        return ""
+    return ("%%.%df" % digits) % value
+
+
+def display_mode_name(mode_name):
+    return MODE_DISPLAY_NAMES.get(mode_name, mode_name)
+
+
+def save_metrics(output_dir, records, device):
     txt_path = os.path.join(output_dir, "big_tif_shp_three_mode_metrics.txt")
     csv_path = os.path.join(output_dir, "big_tif_shp_three_mode_metrics.csv")
     json_path = os.path.join(output_dir, "big_tif_shp_three_mode_metrics.json")
@@ -566,6 +701,19 @@ def save_metrics(output_dir, records):
         "threshold": THRESHOLD,
         "ignore_zero_source_pixels": IGNORE_ZERO_SOURCE_PIXELS,
         "all_touched": ALL_TOUCHED,
+        "timing_protocol": {
+            "device": str(device),
+            "cuda_device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+            "warmup_batches": WARMUP_BATCHES,
+            "batch_size": BATCH_SIZE,
+            "input_size": INPUT_SIZE,
+            "time_unit": "seconds",
+            "inference_time_definition": (
+                "From per-mode inference setup through sliding-window inference, prediction GeoTIFF writing, "
+                "and postprocessing; excludes model loading, label rasterization, and accuracy evaluation."
+            ),
+            "relative_time_baseline": "full_no_tta",
+        },
         "records": records,
     }
 
@@ -574,30 +722,101 @@ def save_metrics(output_dir, records):
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("Big GeoTIFF + SHP three-mode metrics\n\n")
+        f.write("Summary for paper table\n")
+        f.write(
+            "{:<14s} {:>10s} {:>10s} {:>12s} {:>10s} {:>18s} {:>18s}\n".format(
+                "Mode", "PV_IoU", "PV_F1", "PV_Precision", "PV_Recall", "Inference_time_s", "Relative_time"
+            )
+        )
         for mode_name, record in records.items():
             pv = record["metrics"]["PV"]
-            f.write("[%s]\n" % mode_name)
+            timing = record.get("timing") or {}
+            total_seconds = timing.get("total_inference_seconds")
+            relative_time = timing.get("relative_time_vs_full_no_tta")
+            f.write(
+                "{:<14s} {:>10.6f} {:>10.6f} {:>12.6f} {:>10.6f} {:>18s} {:>18s}\n".format(
+                    display_mode_name(mode_name),
+                    pv["IoU"],
+                    pv["F1"],
+                    pv["Precision"],
+                    pv["Recall"],
+                    format_optional(total_seconds, 3),
+                    (format_optional(relative_time, 3) + "x") if relative_time is not None else "",
+                )
+            )
+
+        f.write("\nDetailed metrics and timings\n\n")
+        for mode_name, record in records.items():
+            pv = record["metrics"]["PV"]
+            timing = record.get("timing") or {}
+            f.write("[%s]\n" % display_mode_name(mode_name))
             f.write("PV_Precision: %.6f\n" % pv["Precision"])
             f.write("PV_Recall   : %.6f\n" % pv["Recall"])
             f.write("PV_F1       : %.6f\n" % pv["F1"])
             f.write("PV_IoU      : %.6f\n" % pv["IoU"])
             f.write("mIoU        : %.6f\n" % record["metrics"]["mIoU"])
-            f.write("Accuracy    : %.6f\n\n" % record["metrics"]["Accuracy"])
+            f.write("Accuracy    : %.6f\n" % record["metrics"]["Accuracy"])
+            f.write("Inference_s : %s\n" % format_optional(timing.get("total_inference_seconds"), 6))
+            f.write("Relative    : %s\n" % (
+                (format_optional(timing.get("relative_time_vs_full_no_tta"), 6) + "x")
+                if timing.get("relative_time_vs_full_no_tta") is not None
+                else ""
+            ))
+            f.write("Sliding_s   : %s\n" % format_optional(timing.get("sliding_window_seconds"), 6))
+            f.write("Model_s     : %s\n" % format_optional(timing.get("model_forward_seconds"), 6))
+            f.write("Write_s     : %s\n" % format_optional(timing.get("write_prediction_seconds"), 6))
+            f.write("Post_s      : %s\n" % format_optional(timing.get("postprocess_seconds"), 6))
+            f.write("Tiles       : %s\n" % (timing.get("inferred_tiles") if timing.get("inferred_tiles") is not None else ""))
+            f.write("Forward_pass: %s\n\n" % (
+                timing.get("forward_passes") if timing.get("forward_passes") is not None else ""
+            ))
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["mode", "PV_Precision", "PV_Recall", "PV_F1", "PV_IoU", "mIoU", "Accuracy", "pred_tif"])
+        writer.writerow([
+            "strategy",
+            "PV_IoU",
+            "PV_F1",
+            "PV_Precision",
+            "PV_Recall",
+            "inference_time_seconds",
+            "relative_time_vs_full_no_tta",
+            "mIoU",
+            "Accuracy",
+            "model_forward_seconds",
+            "sliding_window_seconds",
+            "write_prediction_seconds",
+            "postprocess_seconds",
+            "inferred_tiles",
+            "skipped_tiles",
+            "inference_batches",
+            "forward_passes",
+            "forward_samples",
+            "pred_tif",
+        ])
         for mode_name, record in records.items():
             pv = record["metrics"]["PV"]
+            timing = record.get("timing") or {}
             writer.writerow(
                 [
-                    mode_name,
+                    display_mode_name(mode_name),
+                    "%.6f" % pv["IoU"],
+                    "%.6f" % pv["F1"],
                     "%.6f" % pv["Precision"],
                     "%.6f" % pv["Recall"],
-                    "%.6f" % pv["F1"],
-                    "%.6f" % pv["IoU"],
+                    format_optional(timing.get("total_inference_seconds"), 6),
+                    format_optional(timing.get("relative_time_vs_full_no_tta"), 6),
                     "%.6f" % record["metrics"]["mIoU"],
                     "%.6f" % record["metrics"]["Accuracy"],
+                    format_optional(timing.get("model_forward_seconds"), 6),
+                    format_optional(timing.get("sliding_window_seconds"), 6),
+                    format_optional(timing.get("write_prediction_seconds"), 6),
+                    format_optional(timing.get("postprocess_seconds"), 6),
+                    timing.get("inferred_tiles"),
+                    timing.get("skipped_tiles"),
+                    timing.get("inference_batches"),
+                    timing.get("forward_passes"),
+                    timing.get("forward_samples"),
                     record["pred_tif"],
                 ]
             )
@@ -620,6 +839,7 @@ def main():
 
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     model = load_model(WEIGHTS, device)
+    warmup_model(model, device)
 
     records = {}
     label_memmap_path = os.path.join(TEMP_DIR, "label_%s.dat" % datetime.now().strftime("%Y%m%d%H%M%S"))
@@ -650,12 +870,13 @@ def main():
             if not SAVE_PRED_TIF:
                 pred_path = os.path.join(TEMP_DIR, "%s_pv_class.tif" % mode_name)
 
-            run_inference_mode(src, model, mode_name, MODE_CONFIGS[mode_name], pred_path, device)
+            timing = run_inference_mode(src, model, mode_name, MODE_CONFIGS[mode_name], pred_path, device)
             hist = evaluate_prediction(src, label, pred_path)
             records[mode_name] = {
                 "mode_config": MODE_CONFIGS[mode_name],
                 "pred_tif": pred_path,
                 "metrics": metrics_from_hist(hist),
+                "timing": timing,
             }
 
             pv = records[mode_name]["metrics"]["PV"]
@@ -664,7 +885,29 @@ def main():
                 % (mode_name, pv["Precision"], pv["Recall"], pv["F1"], pv["IoU"])
             )
 
-    save_metrics(OUTPUT_DIR, records)
+    add_relative_timings(records)
+    print("\n========== paper table summary ==========")
+    print("mode           IoU      F1       Precision Recall    inference(s) relative")
+    for mode_name, record in records.items():
+        pv = record["metrics"]["PV"]
+        timing = record.get("timing") or {}
+        total_seconds = timing.get("total_inference_seconds")
+        relative_time = timing.get("relative_time_vs_full_no_tta")
+        print(
+            "%-14s %.4f   %.4f   %.4f    %.4f    %12s %8s"
+            % (
+                display_mode_name(mode_name),
+                pv["IoU"],
+                pv["F1"],
+                pv["Precision"],
+                pv["Recall"],
+                format_optional(total_seconds, 3),
+                (format_optional(relative_time, 3) + "x") if relative_time is not None else "",
+            )
+        )
+    print("=========================================\n")
+
+    save_metrics(OUTPUT_DIR, records, device)
 
     if not KEEP_TEMP:
         try:

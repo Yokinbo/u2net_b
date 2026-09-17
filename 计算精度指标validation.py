@@ -3,6 +3,7 @@ import csv
 import datetime
 import json
 import os
+import time
 from typing import List, Union
 
 import numpy as np
@@ -24,6 +25,7 @@ from train_utils import evaluate
 
 
 NAME_CLASSES = ["_background_", "PV"]
+MODEL_NAME = "U²-Net"
 
 
 class SODPresetEval:
@@ -64,6 +66,168 @@ def _to_builtin(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def synchronize_device(device):
+    """CUDA 异步执行，计时前后同步后才能得到真实的模型前向耗时。"""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def count_model_flops(model, dummy_input):
+    """使用 PyTorch Profiler 统计一次前向传播的 FLOPs。
+
+    PyTorch 对支持的卷积、矩阵乘法等算子按一次乘法和一次加法共 2 FLOPs
+    统计。该口径会写入新增的汇总 TXT，便于论文中复现和统一比较。
+    """
+    profiler = getattr(torch, "profiler", None)
+    if profiler is None:
+        raise RuntimeError("当前 PyTorch 不支持 torch.profiler，无法统计 FLOPs。")
+
+    synchronize_device(dummy_input.device)
+    with torch.no_grad():
+        with profiler.profile(
+            activities=[profiler.ProfilerActivity.CPU],
+            with_flops=True,
+        ) as profile_result:
+            model(dummy_input)
+    synchronize_device(dummy_input.device)
+
+    total_flops = sum(float(event.flops or 0.0) for event in profile_result.key_averages())
+    if total_flops <= 0:
+        raise RuntimeError("PyTorch Profiler 未统计到有效 FLOPs。")
+    return total_flops
+
+
+def benchmark_model_efficiency(model, input_size, device, warmup_iters, benchmark_iters):
+    """统计参数量、FLOPs、batch=1 模型前向延迟和 FPS。"""
+    if warmup_iters < 0:
+        raise ValueError("warmup_iters 不能小于 0")
+    if benchmark_iters <= 0:
+        raise ValueError("benchmark_iters 必须大于 0")
+
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    dummy_input = torch.zeros(
+        (1, in_channels, input_size, input_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    total_flops = count_model_flops(model, dummy_input)
+
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    try:
+        with torch.no_grad():
+            for _ in range(warmup_iters):
+                model(dummy_input)
+            synchronize_device(device)
+
+            start = time.perf_counter()
+            for _ in range(benchmark_iters):
+                model(dummy_input)
+            synchronize_device(device)
+            elapsed_seconds = time.perf_counter() - start
+    finally:
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+
+    latency_ms = elapsed_seconds * 1000.0 / benchmark_iters
+    fps = 1000.0 / latency_ms
+    return {
+        "params": int(total_params),
+        "params_m": float(total_params / 1e6),
+        "flops": float(total_flops),
+        "flops_g": float(total_flops / 1e9),
+        "latency_ms_per_image": float(latency_ms),
+        "fps": float(fps),
+        "warmup_iters": int(warmup_iters),
+        "benchmark_iters": int(benchmark_iters),
+        "batch_size": 1,
+        "precision": "FP32",
+        "device": str(device),
+        "cuda_device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+    }
+
+
+def paper_band_label(value):
+    return {
+        "rgb": "rgb",
+        "4band": "4bands",
+        "6band": "6bands",
+    }.get(value, value)
+
+
+def save_paper_summary_txt(output_dir, args, confusion_info, efficiency_info):
+    """新增论文制表用 TXT；不改变现有 metrics.txt/json/csv。"""
+    output_path = os.path.join(output_dir, "验证集精度与效率指标.txt")
+    pv_index = NAME_CLASSES.index("PV")
+    precision = float(confusion_info["Precision"][pv_index])
+    recall = float(confusion_info["Recall"][pv_index])
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    iou = float(confusion_info["IoU"][pv_index])
+    miou = float(confusion_info["mIoU"])
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("U²-Net 语义分割论文制表指标\n")
+        f.write("=" * 96 + "\n\n")
+
+        f.write("一、精度指标\n")
+        f.write(
+            "{:<14s}{:<10s}{:>12s}{:>12s}{:>14s}{:>12s}{:>12s}\n".format(
+                "Model", "Bands", "F1", "IoU", "Precision", "Recall", "mIoU"
+            )
+        )
+        f.write("-" * 86 + "\n")
+        f.write(
+            "{:<14s}{:<10s}{:>12.3f}{:>12.3f}{:>14.3f}{:>12.3f}{:>12.3f}\n\n".format(
+                MODEL_NAME,
+                paper_band_label(band_mode),
+                f1,
+                iou,
+                precision,
+                recall,
+                miou,
+            )
+        )
+
+        f.write("二、效率指标\n")
+        f.write(
+            "{:<14s}{:>14s}{:>14s}{:>24s}{:>14s}\n".format(
+                "Model", "Params(M)", "FLOPs(G)", "Latency(ms/image)", "FPS"
+            )
+        )
+        f.write("-" * 80 + "\n")
+        f.write(
+            "{:<14s}{:>14.3f}{:>14.3f}{:>24.3f}{:>14.3f}\n\n".format(
+                MODEL_NAME,
+                efficiency_info["params_m"],
+                efficiency_info["flops_g"],
+                efficiency_info["latency_ms_per_image"],
+                efficiency_info["fps"],
+            )
+        )
+
+        f.write("评测口径：\n")
+        f.write("1. 精度指标来自当前验证集；Precision、Recall、F1和IoU均为光伏板前景类指标。\n")
+        f.write("2. F1按照 2×Precision×Recall/(Precision+Recall) 计算，mIoU为背景与光伏板IoU的平均值。\n")
+        f.write(
+            "3. 效率输入为 batch=1、{}×{}×{}，FP32，不使用TTA，不包含数据读取、DataLoader、指标计算和后处理。\n".format(
+                in_channels,
+                args.input_size,
+                args.input_size,
+            )
+        )
+        f.write("4. FLOPs由PyTorch Profiler统计支持的算子；一次乘法和一次加法合计为2 FLOPs。\n")
+        f.write(
+            "5. 延迟/FPS：预热{}次，连续前向测试{}次，延迟取平均值，FPS=1000/延迟(ms)。\n".format(
+                efficiency_info["warmup_iters"],
+                efficiency_info["benchmark_iters"],
+            )
+        )
+        f.write("6. 设备：{}。\n".format(efficiency_info["cuda_device_name"] or efficiency_info["device"]))
+
+    return output_path
 
 
 def build_validation_record(args, mae_info, f1_info, confusion_info):
@@ -291,6 +455,30 @@ def main(args):
     output_dir = save_validation_outputs(args, record)
     print(f"Saved validation metrics to: {output_dir}")
 
+    print(
+        "Benchmarking model efficiency: batch=1, warmup={}, iterations={}...".format(
+            args.warmup_iters,
+            args.benchmark_iters,
+        )
+    )
+    efficiency_info = benchmark_model_efficiency(
+        model,
+        args.input_size,
+        device,
+        args.warmup_iters,
+        args.benchmark_iters,
+    )
+    paper_summary_path = save_paper_summary_txt(output_dir, args, confusion_info, efficiency_info)
+    print(
+        "Efficiency: Params={:.4f}M FLOPs={:.4f}G Latency={:.4f}ms/image FPS={:.4f}".format(
+            efficiency_info["params_m"],
+            efficiency_info["flops_g"],
+            efficiency_info["latency_ms_per_image"],
+            efficiency_info["fps"],
+        )
+    )
+    print(f"Saved paper table summary to: {paper_summary_path}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="pytorch u2net multispectral validation")
@@ -299,6 +487,8 @@ def parse_args():
     parser.add_argument("--device", default="cuda:0", help="validation device")
     parser.add_argument("--input-size", default=256, type=int, help="square validation input size")
     parser.add_argument("--save-dir", default="validation_results", help="directory for saved validation metrics")
+    parser.add_argument("--warmup-iters", default=10, type=int, help="efficiency benchmark warm-up iterations")
+    parser.add_argument("--benchmark-iters", default=100, type=int, help="timed forward iterations")
     return parser.parse_args()
 
 
